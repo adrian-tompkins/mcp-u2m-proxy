@@ -25,11 +25,9 @@ CALLBACK_PORT = int(os.getenv("OAUTH_CALLBACK_PORT", "8000"))
 
 # OAuth redirect URL (for deployed environments)
 # Format: https://your-app-url.com/oauth/callback
-#OAUTH_REDIRECT_URL = f"{os.getenv("DATABRICKS_APP_URL")}/oauth/callback"
-#print(f"OAUTH_REDIRECT_URL: {OAUTH_REDIRECT_URL}")
-#OAUTH_REDIRECT_URL = "http://localhost:8000/oauth/callback"
-OAUTH_REDIRECT_URL = "None/oauth/callback"
-
+#OAUTH_REDIRECT_URL = f"{os.getenv("DATABRICKS_APP_URL", "http://localhost:8000")}/oauth/callback"
+OAUTH_REDIRECT_URL = "https://mcp-u2m-proxy-1444828305810485.aws.databricksapps.com/oauth/callback"
+print(f"OAUTH_REDIRECT_URL: {OAUTH_REDIRECT_URL}")
 # Per-user OAuth managers
 oauth_managers: Dict[str, OAuthManager] = {}
 
