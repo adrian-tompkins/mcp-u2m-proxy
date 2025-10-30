@@ -1,18 +1,20 @@
 """
 Proxy endpoints and handlers for forwarding requests to the upstream MCP server
 """
+import re
 from fastapi import Request, HTTPException
 from fastapi.responses import StreamingResponse, Response
 import httpx
 
 from .auth import check_auth_status
+from .logger import logger
 
 
 async def _proxy_sse_handler(request: Request, oauth_manager, upstream_url: str):
     """Shared SSE proxy handler logic"""
-    print(f"\n[SSE] Incoming request: {request.method} {request.url.path}")
-    print(f"[SSE] Query params: {dict(request.query_params)}")
-    print(f"[SSE] Headers: {dict(request.headers)}")
+    logger.debug(f"[SSE] Incoming request: {request.method} {request.url.path}")
+    logger.debug(f"[SSE] Query params: {dict(request.query_params)}")
+    logger.debug(f"[SSE] Headers: {dict(request.headers)}")
     
     # Check authentication
     if not await check_auth_status(oauth_manager):
@@ -31,11 +33,11 @@ async def _proxy_sse_handler(request: Request, oauth_manager, upstream_url: str)
     body = None
     if request.method == "POST":
         body = await request.body()
-        print(f"[SSE] Request body: {body[:200] if body else None}")
+        logger.debug(f"[SSE] Request body: {body[:200] if body else None}")
     
     # Construct upstream URL
     sse_url = f"{upstream_url}/sse"
-    print(f"[SSE] Proxying to: {sse_url} (method: {request.method}, has_body: {body is not None})")
+    logger.debug(f"[SSE] Proxying to: {sse_url} (method: {request.method}, has_body: {body is not None})")
     
     # Prepare headers
     headers = {
@@ -57,14 +59,14 @@ async def _proxy_sse_handler(request: Request, oauth_manager, upstream_url: str)
                 content=body,
             )
             
-            print(f"[SSE] Upstream response status: {response.status_code}")
-            print(f"[SSE] Upstream response headers: {dict(response.headers)}")
+            logger.debug(f"[SSE] Upstream response status: {response.status_code}")
+            logger.debug(f"[SSE] Upstream response headers: {dict(response.headers)}")
             
             # If error, return it immediately with proper headers
             if response.status_code >= 400:
                 error_text = response.text
-                print(f"[SSE] Upstream error ({response.status_code}): {error_text}")
-                print(f"[SSE] Returning error to client for fallback")
+                logger.info(f"[SSE] Upstream error ({response.status_code}): {error_text}")
+                logger.debug(f"[SSE] Returning error to client for fallback")
                 
                 # Return the error response exactly as received from upstream
                 return Response(
@@ -74,7 +76,7 @@ async def _proxy_sse_handler(request: Request, oauth_manager, upstream_url: str)
                 )
             
             # If success, return the response
-            print(f"[SSE] POST successful, returning response")
+            logger.debug(f"[SSE] POST successful, returning response")
             return Response(
                 content=response.content,
                 status_code=response.status_code,
@@ -82,7 +84,7 @@ async def _proxy_sse_handler(request: Request, oauth_manager, upstream_url: str)
             )
     else:
         # GET requests are SSE connections - stream directly without checking first
-        print(f"[SSE] GET request - setting up SSE streaming...")
+        logger.debug(f"[SSE] GET request - setting up SSE streaming...")
         
         async def stream_from_upstream():
             async with httpx.AsyncClient(timeout=None) as stream_client:
@@ -93,24 +95,24 @@ async def _proxy_sse_handler(request: Request, oauth_manager, upstream_url: str)
                     params=request.query_params,
                     content=body,
                 ) as stream_response:
-                    print(f"[SSE] Upstream response status: {stream_response.status_code}")
+                    logger.debug(f"[SSE] Upstream response status: {stream_response.status_code}")
                     
                     # If error, we can't really handle it here after headers are sent
                     # But at least log it
                     if stream_response.status_code >= 400:
                         error_body = await stream_response.aread()
                         error_text = error_body.decode('utf-8', errors='ignore')
-                        print(f"[SSE] Upstream error ({stream_response.status_code}): {error_text}")
+                        logger.error(f"[SSE] Upstream error ({stream_response.status_code}): {error_text}")
                         return
                     
                     chunk_count = 0
                     async for chunk in stream_response.aiter_bytes():
                         chunk_count += 1
                         if chunk_count <= 3:
-                            print(f"[SSE] Streaming chunk {chunk_count}: {len(chunk)} bytes")
+                            logger.debug(f"[SSE] Streaming chunk {chunk_count}: {len(chunk)} bytes")
                         yield chunk
                     
-                    print(f"[SSE] Finished streaming {chunk_count} chunks")
+                    logger.debug(f"[SSE] Finished streaming {chunk_count} chunks")
         
         return StreamingResponse(
             stream_from_upstream(),
@@ -125,7 +127,7 @@ async def _proxy_sse_handler(request: Request, oauth_manager, upstream_url: str)
 
 async def _proxy_message_handler(request: Request, oauth_manager, upstream_url: str):
     """Shared message proxy handler logic"""
-    print(f"\n[MESSAGE] Incoming request: {request.method} {request.url.path}")
+    logger.debug(f"[MESSAGE] Incoming request: {request.method} {request.url.path}")
     
     # Check authentication
     if not await check_auth_status(oauth_manager):
@@ -144,7 +146,7 @@ async def _proxy_message_handler(request: Request, oauth_manager, upstream_url: 
     
     # Construct upstream URL
     message_url = f"{upstream_url}/message"
-    print(f"[MESSAGE] Proxying to: {message_url}")
+    logger.debug(f"[MESSAGE] Proxying to: {message_url}")
     
     # Prepare headers with OAuth token
     headers = {
@@ -186,32 +188,44 @@ async def _proxy_message_handler(request: Request, oauth_manager, upstream_url: 
         )
 
 
-def register_proxy_routes(app, oauth_manager, upstream_url: str):
+def register_proxy_routes(app, get_user_id_fn, get_oauth_manager_fn, upstream_url: str):
     """Register proxy routes on the FastAPI app"""
     
-    # Proxy SSE endpoint (both with and without /v1 prefix)
+    # Proxy SSE endpoint (without version prefix)
     @app.api_route("/sse", methods=["GET", "POST"])
     async def proxy_sse(request: Request):
         """Proxy SSE connections to upstream MCP server"""
+        user_id = get_user_id_fn(request)
+        oauth_manager = get_oauth_manager_fn(user_id)
         return await _proxy_sse_handler(request, oauth_manager, upstream_url)
     
     
-    @app.api_route("/v1/sse", methods=["GET", "POST"])
-    async def proxy_sse_v1(request: Request):
-        """Proxy SSE connections to upstream MCP server (v1 prefix)"""
+    # Proxy SSE endpoint (with version prefix - supports v1, v2, v3, etc.)
+    @app.api_route("/v{version:int}/sse", methods=["GET", "POST"])
+    async def proxy_sse_versioned(version: int, request: Request):
+        """Proxy SSE connections to upstream MCP server (versioned)"""
+        logger.debug(f"[SSE] Request for version v{version}")
+        user_id = get_user_id_fn(request)
+        oauth_manager = get_oauth_manager_fn(user_id)
         return await _proxy_sse_handler(request, oauth_manager, upstream_url)
     
     
-    # Proxy POST endpoint for messages (both with and without /v1 prefix)
+    # Proxy POST endpoint for messages (without version prefix)
     @app.post("/message")
     async def proxy_message(request: Request):
         """Proxy POST requests to upstream MCP server"""
+        user_id = get_user_id_fn(request)
+        oauth_manager = get_oauth_manager_fn(user_id)
         return await _proxy_message_handler(request, oauth_manager, upstream_url)
     
     
-    @app.post("/v1/message")
-    async def proxy_message_v1(request: Request):
-        """Proxy POST requests to upstream MCP server (v1 prefix)"""
+    # Proxy POST endpoint for messages (with version prefix - supports v1, v2, v3, etc.)
+    @app.post("/v{version:int}/message")
+    async def proxy_message_versioned(version: int, request: Request):
+        """Proxy POST requests to upstream MCP server (versioned)"""
+        logger.debug(f"[MESSAGE] Request for version v{version}")
+        user_id = get_user_id_fn(request)
+        oauth_manager = get_oauth_manager_fn(user_id)
         return await _proxy_message_handler(request, oauth_manager, upstream_url)
     
     
@@ -219,13 +233,24 @@ def register_proxy_routes(app, oauth_manager, upstream_url: str):
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
     async def proxy_all(request: Request, path: str):
         """Proxy all other requests to upstream MCP server"""
-        print(f"\n[PROXY_ALL] Incoming request: {request.method} {request.url.path} (captured path: {path})")
+        logger.debug(f"[PROXY_ALL] Incoming request: {request.method} {request.url.path} (captured path: {path})")
         
         # Skip paths that have dedicated handlers
-        skip_paths = ["oauth/", "api/", "sse", "message", "v1/sse", "v1/message", ""]
+        skip_paths = ["oauth/", "api/", "sse", "message", ""]
+        
+        # Check static skip paths
         if any(path.startswith(p) if p.endswith("/") else path == p for p in skip_paths):
-            print(f"[PROXY_ALL] Skipping path: {path}")
+            logger.debug(f"[PROXY_ALL] Skipping path: {path}")
             raise HTTPException(status_code=404, detail="Not found")
+        
+        # Check versioned endpoints (v1/sse, v2/message, v99/sse, etc.)
+        if re.match(r'^v\d+/(sse|message)$', path):
+            logger.debug(f"[PROXY_ALL] Skipping versioned path: {path}")
+            raise HTTPException(status_code=404, detail="Not found")
+        
+        # Get user-specific oauth manager
+        user_id = get_user_id_fn(request)
+        oauth_manager = get_oauth_manager_fn(user_id)
         
         # Check authentication
         if not await check_auth_status(oauth_manager):

@@ -14,6 +14,8 @@ from urllib.parse import urlencode, parse_qs, urlparse
 import httpx
 from datetime import datetime, timedelta
 
+from .logger import logger
+
 
 class OAuthManager:
     """Manages OAuth authentication flow for MCP server"""
@@ -23,24 +25,38 @@ class OAuthManager:
         server_url: str,
         callback_port: int = 3000,
         client_name: str = "MCP Proxy",
-        config_dir: Optional[Path] = None
+        config_dir: Optional[Path] = None,
+        user_id: Optional[str] = None,
+        redirect_url: Optional[str] = None
     ):
         self.server_url = server_url.rstrip("/")
         self.callback_port = callback_port
         self.client_name = client_name
+        self.user_id = user_id or "default"
+        self._redirect_url = redirect_url  # Custom redirect URL (for deployed environments)
         
-        # Create config directory for storing tokens
+        # Create config directory for storing tokens (per-user)
         if config_dir is None:
-            config_dir = Path.home() / ".mcp" / "auth"
+            config_dir = Path.home() / ".mcp" / "auth" / self.user_id
         self.config_dir = config_dir
         self.config_dir.mkdir(parents=True, exist_ok=True)
         
         # Hash server URL for file naming
         self.server_hash = hashlib.sha256(server_url.encode()).hexdigest()[:16]
         
-        # OAuth state
-        self.state = secrets.token_urlsafe(32)
-        self.code_verifier = secrets.token_urlsafe(64)
+        # OAuth state and PKCE - load from disk if available, otherwise generate new
+        auth_state = self.load_auth_state()
+        if auth_state:
+            self.state = auth_state["state"]
+            self.code_verifier = auth_state["code_verifier"]
+            logger.debug(f"Loaded existing auth state for user {self.user_id}")
+        else:
+            # Generate new state (include user_id for callback routing)
+            base_state = secrets.token_urlsafe(32)
+            self.state = f"{base_state}|{self.user_id}"
+            self.code_verifier = secrets.token_urlsafe(64)
+            logger.debug(f"Generated new auth state for user {self.user_id}")
+        
         self.code_challenge = self._generate_code_challenge(self.code_verifier)
         
         # Client info
@@ -61,6 +77,10 @@ class OAuthManager:
     @property
     def redirect_uri(self) -> str:
         """OAuth redirect URI"""
+        if self._redirect_url:
+            # Use custom redirect URL (for deployed environments)
+            return self._redirect_url
+        # Default to localhost (for local development)
         return f"http://localhost:{self.callback_port}/oauth/callback"
     
     @property
@@ -95,13 +115,10 @@ class OAuthManager:
             json.dump(data, f, indent=2)
     
     def load_tokens(self) -> Optional[Dict[str, Any]]:
-        """Load saved OAuth tokens"""
+        """Load saved OAuth tokens (including expired ones that can be refreshed)"""
         tokens = self._load_json("tokens.json")
-        if tokens:
-            # Check if tokens are expired
-            expires_at = tokens.get("expires_at")
-            if expires_at and datetime.fromisoformat(expires_at) < datetime.now():
-                return None
+        # Return tokens even if access token is expired - we can refresh them
+        # Only return None if there are no tokens at all
         self.tokens = tokens
         return tokens
     
@@ -115,6 +132,26 @@ class OAuthManager:
         self.tokens = tokens
         self._save_json("tokens.json", tokens)
     
+    def load_auth_state(self) -> Optional[Dict[str, Any]]:
+        """Load saved auth state (state and code_verifier for PKCE)"""
+        return self._load_json("auth_state.json")
+    
+    def save_auth_state(self) -> None:
+        """Save auth state for OAuth flow"""
+        auth_state = {
+            "state": self.state,
+            "code_verifier": self.code_verifier,
+            "created_at": datetime.now().isoformat()
+        }
+        self._save_json("auth_state.json", auth_state)
+    
+    def clear_auth_state(self) -> None:
+        """Clear saved auth state after successful authentication"""
+        path = self._get_file_path("auth_state.json")
+        if path.exists():
+            path.unlink()
+            logger.debug(f"Cleared auth state for user {self.user_id}")
+    
     def load_client_info(self) -> Optional[Dict[str, Any]]:
         """Load saved client information"""
         self.client_info = self._load_json("client_info.json")
@@ -127,7 +164,7 @@ class OAuthManager:
     
     def clear_credentials(self) -> None:
         """Clear all saved credentials"""
-        for filename in ["tokens.json", "client_info.json"]:
+        for filename in ["tokens.json", "client_info.json", "auth_state.json"]:
             path = self._get_file_path(filename)
             if path.exists():
                 path.unlink()
@@ -150,18 +187,18 @@ class OAuthManager:
             
             for well_known_url in well_known_urls:
                 try:
-                    print(f"Trying OAuth discovery at: {well_known_url}")
+                    logger.debug(f"Trying OAuth discovery at: {well_known_url}")
                     response = await client.get(well_known_url)
                     response.raise_for_status()
                     oauth_config = response.json()
-                    print(f"✓ Discovered OAuth endpoints from {well_known_url}")
+                    logger.info(f"Discovered OAuth endpoints from {well_known_url}")
                     return oauth_config
                 except Exception as e:
-                    print(f"  Could not discover at {well_known_url}: {e}")
+                    logger.debug(f"Could not discover at {well_known_url}: {e}")
                     continue
             
             # Fallback: try standard endpoints at base domain and server URL
-            print(f"Using fallback OAuth endpoint discovery")
+            logger.info("Using fallback OAuth endpoint discovery")
             return {
                 "registration_endpoint": f"{base_url}/oauth/register",
                 "authorization_endpoint": f"{base_url}/oauth/authorize",
@@ -174,7 +211,7 @@ class OAuthManager:
         # Check if client already registered
         client_info = self.load_client_info()
         if client_info:
-            print(f"Using existing client registration: {client_info.get('client_id')}")
+            logger.info(f"Using existing client registration: {client_info.get('client_id')}")
             return client_info
         
         # Discover OAuth endpoints
@@ -186,7 +223,7 @@ class OAuthManager:
             raise Exception("No registration endpoint found in OAuth configuration")
         
         async with httpx.AsyncClient() as client:
-            print(f"Registering OAuth client at: {registration_endpoint}")
+            logger.debug(f"Registering OAuth client at: {registration_endpoint}")
             try:
                 response = await client.post(registration_endpoint, json=self.client_metadata)
                 response.raise_for_status()
@@ -195,11 +232,11 @@ class OAuthManager:
                 client_info["oauth_config"] = oauth_config
                 
                 self.save_client_info(client_info)
-                print(f"✓ Registered new OAuth client: {client_info.get('client_id')}")
+                logger.info(f"Registered new OAuth client: {client_info.get('client_id')}")
                 
                 return client_info
             except httpx.HTTPStatusError as e:
-                print(f"✗ Registration failed: {e.response.status_code} {e.response.text}")
+                logger.error(f"Registration failed: {e.response.status_code} {e.response.text}")
                 raise Exception(
                     f"OAuth client registration failed at {registration_endpoint}: "
                     f"{e.response.status_code} - {e.response.text}"
@@ -211,6 +248,10 @@ class OAuthManager:
         client_info = await self.register_client()
         oauth_config = client_info.get("oauth_config", {})
         
+        # Save auth state to disk so it persists across app restarts/reloads
+        self.save_auth_state()
+        logger.debug(f"Saved auth state for user {self.user_id} (state: {self.state[:20]}...)")
+        
         # Build authorization URL
         auth_endpoint = oauth_config.get("authorization_endpoint", f"{self.server_url}/oauth/authorize")
         
@@ -221,7 +262,8 @@ class OAuthManager:
             "state": self.state,
             "code_challenge": self.code_challenge,
             "code_challenge_method": "S256",
-            "scope": "openid profile email",
+            # Include offline_access to get long-lived refresh tokens
+            "scope": "openid profile email offline_access",
         }
         
         auth_url = f"{auth_endpoint}?{urlencode(params)}"
@@ -229,13 +271,13 @@ class OAuthManager:
     
     def open_browser_for_auth(self, auth_url: str) -> None:
         """Open browser for user authentication"""
-        print(f"\nOpening browser for authentication...")
-        print(f"If browser doesn't open, visit: {auth_url}\n")
+        logger.info("Opening browser for authentication...")
+        logger.info(f"If browser doesn't open, visit: {auth_url}")
         try:
             webbrowser.open(auth_url)
         except Exception as e:
-            print(f"Could not open browser automatically: {e}")
-            print(f"Please visit the URL above manually.")
+            logger.warning(f"Could not open browser automatically: {e}")
+            logger.info("Please visit the URL above manually.")
     
     async def wait_for_auth_code(self, timeout: int = 300) -> str:
         """Wait for OAuth callback with authorization code"""
@@ -271,7 +313,10 @@ class OAuthManager:
             tokens = response.json()
             self.save_tokens(tokens)
             
-            print("Successfully obtained access tokens")
+            # Clear auth state after successful token exchange
+            self.clear_auth_state()
+            
+            logger.info("Successfully obtained access tokens")
             return tokens
     
     async def refresh_access_token(self) -> Dict[str, Any]:
@@ -296,11 +341,18 @@ class OAuthManager:
             response = await client.post(token_endpoint, data=data)
             response.raise_for_status()
             
-            tokens = response.json()
-            self.save_tokens(tokens)
+            new_tokens = response.json()
             
-            print("Successfully refreshed access token")
-            return tokens
+            # Some OAuth servers don't return a new refresh token when refreshing
+            # In that case, preserve the existing refresh token
+            if "refresh_token" not in new_tokens and "refresh_token" in self.tokens:
+                new_tokens["refresh_token"] = self.tokens["refresh_token"]
+                logger.debug("Preserved existing refresh token (server didn't return a new one)")
+            
+            self.save_tokens(new_tokens)
+            
+            logger.info("Successfully refreshed access token")
+            return new_tokens
     
     async def get_valid_access_token(self) -> str:
         """Get a valid access token, refreshing if necessary"""
@@ -310,15 +362,33 @@ class OAuthManager:
         if not tokens:
             raise Exception("No tokens available - authentication required")
         
-        # Check if token is expired
+        if "refresh_token" not in tokens:
+            logger.warning("No refresh token available - user will need to re-authenticate when token expires")
+        
+        # Check if token is expired or will expire soon (within 5 minutes)
         expires_at = tokens.get("expires_at")
-        if expires_at and datetime.fromisoformat(expires_at) < datetime.now():
-            # Try to refresh
-            try:
-                tokens = await self.refresh_access_token()
-            except Exception as e:
-                print(f"Failed to refresh token: {e}")
-                raise Exception("Token expired and refresh failed - re-authentication required")
+        refresh_buffer = timedelta(minutes=5)
+        
+        if expires_at:
+            expiry_time = datetime.fromisoformat(expires_at)
+            time_until_expiry = expiry_time - datetime.now()
+            
+            if time_until_expiry < refresh_buffer:
+                # Token expired or expiring soon - refresh it
+                if "refresh_token" in tokens:
+                    try:
+                        logger.info(f"Access token expires in {time_until_expiry.total_seconds():.0f}s - refreshing now")
+                        tokens = await self.refresh_access_token()
+                    except Exception as e:
+                        logger.error(f"Failed to refresh token: {e}")
+                        # If token is already expired, require re-auth
+                        if time_until_expiry.total_seconds() < 0:
+                            raise Exception("Token expired and refresh failed - re-authentication required")
+                        # Otherwise, use the existing token (still valid for a bit)
+                        logger.warning("Refresh failed but token still valid - will retry on next request")
+                else:
+                    if time_until_expiry.total_seconds() < 0:
+                        raise Exception("Token expired and no refresh token available - re-authentication required")
         
         return tokens["access_token"]
     

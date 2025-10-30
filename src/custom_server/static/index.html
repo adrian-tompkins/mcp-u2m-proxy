@@ -277,10 +277,14 @@
                 </div>
             </div>
 
-            <div class="status-details" id="statusDetails" style="display: none;">
+            <div class="status-details" id="statusDetails">
                 <div class="detail-row">
                     <span class="detail-label">Upstream Server:</span>
                     <span class="detail-value" id="upstreamUrl">-</span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">User ID:</span>
+                    <span class="detail-value" id="userId">-</span>
                 </div>
                 <div class="detail-row" id="clientIdRow" style="display: none;">
                     <span class="detail-label">Client ID:</span>
@@ -330,7 +334,7 @@
                 const data = await response.json();
 
                 document.getElementById('upstreamUrl').textContent = data.upstream_url || '-';
-                document.getElementById('statusDetails').style.display = 'block';
+                document.getElementById('userId').textContent = data.user_id || 'default';
 
                 if (data.authenticated) {
                     showAuthenticated(data);

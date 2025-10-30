@@ -6,6 +6,7 @@ from fastapi.responses import HTMLResponse
 from urllib.parse import parse_qs
 
 from .templates import oauth_success_template, oauth_error_template
+from .logger import logger
 
 
 async def check_auth_status(oauth_manager):
@@ -24,17 +25,21 @@ async def check_auth_status(oauth_manager):
         return False
 
 
-def register_auth_routes(app, oauth_manager, upstream_url: str):
+def register_auth_routes(app, get_user_id_fn, get_oauth_manager_fn, upstream_url: str):
     """Register authentication routes on the FastAPI app"""
     
     @app.get("/api/auth/status")
-    async def get_auth_status():
+    async def get_auth_status(request: Request):
         """Get current authentication status"""
+        user_id = get_user_id_fn(request)
+        oauth_manager = get_oauth_manager_fn(user_id)
+        
         is_authenticated = await check_auth_status(oauth_manager)
         
         response = {
             "authenticated": is_authenticated,
             "upstream_url": upstream_url,
+            "user_id": user_id,
         }
         
         if is_authenticated:
@@ -47,8 +52,11 @@ def register_auth_routes(app, oauth_manager, upstream_url: str):
     
     
     @app.post("/api/auth/start")
-    async def start_auth():
+    async def start_auth(request: Request):
         """Start OAuth authentication flow"""
+        user_id = get_user_id_fn(request)
+        oauth_manager = get_oauth_manager_fn(user_id)
+        
         try:
             # Register client if needed
             await oauth_manager.register_client()
@@ -56,16 +64,17 @@ def register_auth_routes(app, oauth_manager, upstream_url: str):
             # Start auth flow
             auth_url = await oauth_manager.start_auth_flow()
             
-            print(f"\nAuthentication initiated from web UI")
-            print(f"Authorization URL: {auth_url}\n")
+            logger.info(f"Authentication initiated from web UI for user: {user_id}")
+            logger.debug(f"Authorization URL: {auth_url}")
             
             return {
                 "success": True,
                 "auth_url": auth_url,
-                "message": "Opening browser for authentication..."
+                "message": "Opening browser for authentication...",
+                "user_id": user_id
             }
         except Exception as e:
-            print(f"Error starting auth: {e}")
+            logger.error(f"Error starting auth for user {user_id}: {e}")
             return {
                 "success": False,
                 "error": str(e)
@@ -73,14 +82,18 @@ def register_auth_routes(app, oauth_manager, upstream_url: str):
     
     
     @app.post("/api/auth/clear")
-    async def clear_auth():
+    async def clear_auth(request: Request):
         """Clear saved credentials"""
+        user_id = get_user_id_fn(request)
+        oauth_manager = get_oauth_manager_fn(user_id)
+        
         try:
             oauth_manager.clear_credentials()
-            print("\nCredentials cleared from web UI\n")
+            logger.info(f"Credentials cleared from web UI for user: {user_id}")
             return {
                 "success": True,
-                "message": "Credentials cleared successfully"
+                "message": "Credentials cleared successfully",
+                "user_id": user_id
             }
         except Exception as e:
             return {
@@ -92,9 +105,23 @@ def register_auth_routes(app, oauth_manager, upstream_url: str):
     @app.get("/oauth/callback", include_in_schema=False)
     async def oauth_callback(request: Request):
         """Handle OAuth callback"""
+        user_id = get_user_id_fn(request)
+        
+        # Try to get user_id from state parameter if not in headers
         query_string = str(request.url).split("?", 1)[1] if "?" in str(request.url) else ""
         query_params = parse_qs(query_string)
         
+        # If user_id is 'default' (no header), try to get it from state
+        # The state format could be: "state_value|user_id"
+        if user_id == "default" and "state" in query_params:
+            state = query_params["state"][0]
+            if "|" in state:
+                # Extract user_id from state
+                _, state_user_id = state.rsplit("|", 1)
+                user_id = state_user_id
+                logger.debug(f"Extracted user_id from state: {user_id}")
+        
+        oauth_manager = get_oauth_manager_fn(user_id)
         result = oauth_manager.handle_callback(query_params)
         
         # If successful, exchange code for tokens
@@ -102,9 +129,9 @@ def register_auth_routes(app, oauth_manager, upstream_url: str):
             try:
                 code = oauth_manager.auth_code
                 await oauth_manager.exchange_code_for_tokens(code)
-                print("✓ OAuth authentication completed successfully\n")
+                logger.info(f"OAuth authentication completed successfully for user: {user_id}")
             except Exception as e:
-                print(f"✗ Failed to exchange code for tokens: {e}\n")
+                logger.error(f"Failed to exchange code for tokens for user {user_id}: {e}")
                 result = {
                     "status": "error",
                     "message": f"Failed to complete authentication: {e}"
@@ -112,7 +139,7 @@ def register_auth_routes(app, oauth_manager, upstream_url: str):
         
         # Return appropriate HTML response
         if result["status"] == "success":
-            html_content = oauth_success_template(result["message"])
+            html_content = oauth_success_template(f"{result['message']} (user: {user_id})")
         else:
             html_content = oauth_error_template(result["message"])
         
