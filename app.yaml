@@ -2,3 +2,5 @@ command: ["uv", "run", "custom-server"]
 env:
   - name: "UPSTREAM_MCP_URL"
     value: "https://mcp.atlassian.com/v1"
+  - name: "DEBUG"
+    value: "1"

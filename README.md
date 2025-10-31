@@ -8,6 +8,7 @@ This is an **OAuth-enabled MCP proxy server** that can be deployed on Databricks
 - 🔄 **Automatic Token Refresh** - Seamlessly handles token expiration with proactive refresh (users stay authenticated long-term)
 - ⏰ **Long-Lived Sessions** - Requests `offline_access` scope for persistent refresh tokens
 - 🌐 **Full MCP Protocol Support** - Proxies SSE, messages, and all MCP endpoints (including versioned endpoints like `/v1/sse`, `/v2/sse`, etc.)
+- 🌉 **Protocol Bridge** - Translates between Streamable HTTP clients and SSE-only upstream servers using MCP SDK
 - 💾 **Persistent Token Storage** - Saves credentials for reuse
 - 👥 **Multi-User Support** - Manages separate authentication for each user via headers
 - 🎨 **Beautiful Auth UI** - Clean OAuth callback pages
@@ -91,7 +92,7 @@ export OAUTH_REDIRECT_URL="https://your-app-url.com/oauth/callback"
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `UPSTREAM_MCP_URL` | ✅ Yes | - | The URL of the upstream MCP server to proxy to |
+| `UPSTREAM_MCP_URL` | ✅ Yes | - | The base URL of the upstream MCP server (with or without `/sse` suffix) |
 | `OAUTH_CALLBACK_PORT` | No | `8000` | Port for OAuth callbacks and the web server (local dev only) |
 | `OAUTH_REDIRECT_URL` | No | `http://localhost:{port}/oauth/callback` | Full OAuth callback URL for deployed environments |
 | `DEBUG` | No | Not set | Enable debug logging. Set to `1`, `true`, `yes`, or `on` |
@@ -236,14 +237,78 @@ databricks bundle deploy
 databricks bundle run custom-mcp-server
 ```
 
+## Protocol Bridge: Streamable HTTP ↔ SSE
+
+The proxy includes a **protocol bridge** that allows Streamable HTTP clients to connect to SSE-only upstream servers.
+
+### Problem It Solves
+
+- **Your Client**: Only supports Streamable HTTP (`POST /mcp` with streaming responses)
+- **Upstream Server**: Only supports SSE (`GET /sse` for events + `POST /message` for requests)
+- **Solution**: The proxy translates between the two protocols automatically!
+
+### How to Use It
+
+**Streamable HTTP Client → `/mcp` endpoint:**
+
+```python
+# Client connects to the proxy using Streamable HTTP
+client = MCPClient(url="http://localhost:8000/mcp", transport="streamable-http")
+
+# Proxy translates to SSE for the upstream server
+# All MCP operations work transparently
+tools = await client.list_tools()
+result = await client.call_tool("my_tool", {"arg": "value"})
+```
+
+### Supported Endpoints
+
+| Client Type | Endpoint | Upstream Translation |
+|-------------|----------|---------------------|
+| **Streamable HTTP** | `POST /mcp` | → SSE (`GET /sse` + `POST /message`) |
+| **SSE** | `GET /sse` | → Direct proxy to upstream |
+| **SSE** | `POST /message` | → Direct proxy to upstream |
+
+### How It Works
+
+1. **Client sends** JSON-RPC request to `POST /mcp`
+2. **Proxy maintains** persistent SSE connection to upstream (one per user)
+3. **Proxy forwards** request via `POST /message` to upstream
+4. **Proxy receives** response via SSE stream
+5. **Proxy returns** response to client as streaming HTTP
+
+### Supported MCP Methods
+
+The bridge supports all standard MCP methods:
+- ✅ `initialize` - Initialize the session
+- ✅ `tools/list` - List available tools
+- ✅ `tools/call` - Call a tool
+- ✅ `resources/list` - List resources
+- ✅ `resources/read` - Read a resource
+- ✅ `prompts/list` - List prompts
+- ✅ `prompts/get` - Get a prompt
+
+### Per-User Sessions
+
+The bridge maintains separate MCP sessions for each user (identified by `X-Forwarded-User` header), ensuring:
+- 🔒 Isolated authentication per user
+- 🔄 Persistent connections for efficiency
+- 🚀 Low latency after initial connection
+
 ## Connecting to the MCP Proxy
 
 ### Deployed on Databricks Apps
 
-When deployed on Databricks Apps, connect using the SSE endpoint:
+When deployed on Databricks Apps, you can connect using either:
 
+**SSE endpoint (recommended for SSE-capable clients):**
 ```
 https://your-app-url.databricksapps.com/sse
+```
+
+**Streamable HTTP endpoint (for Streamable HTTP-only clients):**
+```
+https://your-app-url.databricksapps.com/mcp
 ```
 
 **Important Notes for Databricks Deployment:**
@@ -258,10 +323,16 @@ https://your-app-url.databricksapps.com/sse
 
 ### Local Development
 
-For local development or when the proxy is running locally:
+For local development, you can connect using either:
 
+**SSE endpoint:**
 ```
 http://localhost:8000/sse
+```
+
+**Streamable HTTP endpoint:**
+```
+http://localhost:8000/mcp
 ```
 
 ### Example Client Configurations

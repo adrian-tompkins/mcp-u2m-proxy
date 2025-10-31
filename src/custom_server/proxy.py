@@ -2,12 +2,14 @@
 Proxy endpoints and handlers for forwarding requests to the upstream MCP server
 """
 import re
+import json
 from fastapi import Request, HTTPException
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse, Response, JSONResponse
 import httpx
 
 from .auth import check_auth_status
 from .logger import logger
+from .mcp_bridge_v2 import mcp_bridge_v2
 
 
 async def _proxy_sse_handler(request: Request, oauth_manager, upstream_url: str):
@@ -28,6 +30,11 @@ async def _proxy_sse_handler(request: Request, oauth_manager, upstream_url: str)
         access_token = await oauth_manager.get_valid_access_token()
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Authentication required: {e}")
+    
+    # Use query params as-is (don't generate sessionId)
+    # If upstream requires sessionId and client doesn't provide it, the 404 error
+    # will cause the client to fall back to pure SSE mode (GET only)
+    query_params = request.query_params
     
     # Read request body if present (for POST requests)
     body = None
@@ -55,7 +62,7 @@ async def _proxy_sse_handler(request: Request, oauth_manager, upstream_url: str)
                 request.method,
                 sse_url,
                 headers=headers,
-                params=request.query_params,
+                params=query_params,
                 content=body,
             )
             
@@ -92,7 +99,7 @@ async def _proxy_sse_handler(request: Request, oauth_manager, upstream_url: str)
                     request.method,
                     sse_url,
                     headers=headers,
-                    params=request.query_params,
+                    params=query_params,
                     content=body,
                 ) as stream_response:
                     logger.debug(f"[SSE] Upstream response status: {stream_response.status_code}")
@@ -188,6 +195,69 @@ async def _proxy_message_handler(request: Request, oauth_manager, upstream_url: 
         )
 
 
+async def _streamable_http_bridge_handler(request: Request, oauth_manager, upstream_url: str, user_id: str):
+    """
+    Bridge handler for Streamable HTTP clients connecting to SSE upstream.
+    Uses MCP Python SDK to translate between protocols.
+    """
+    logger.debug(f"[Bridge] Incoming Streamable HTTP request from user {user_id}")
+    
+    # Check authentication
+    if not await check_auth_status(oauth_manager):
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required. Please visit http://localhost:8000/ to authenticate."
+        )
+    
+    # Get access token
+    try:
+        access_token = await oauth_manager.get_valid_access_token()
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Authentication required: {e}")
+    
+    # Read JSON-RPC request
+    try:
+        body = await request.body()
+        json_rpc_request = json.loads(body)
+        logger.debug(f"[Bridge] JSON-RPC request: {json_rpc_request.get('method')}")
+    except json.JSONDecodeError as e:
+        return JSONResponse(
+            {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {
+                    "code": -32700,
+                    "message": "Parse error: Invalid JSON"
+                }
+            },
+            status_code=400
+        )
+    
+    try:
+        # Use the MCP bridge V2 to handle the request
+        response = await mcp_bridge_v2.handle_request(
+            user_id=user_id,
+            upstream_url=upstream_url,
+            access_token=access_token,
+            json_rpc_request=json_rpc_request
+        )
+        
+        logger.debug(f"[Bridge] Got response, returning to client")
+        logger.debug(f"[Bridge] Response type: {type(response)}")
+        logger.debug(f"[Bridge] Response keys: {response.keys() if isinstance(response, dict) else 'not a dict'}")
+        
+        # Return as JSON response
+        json_response = JSONResponse(
+            content=response,
+            media_type="application/json"
+        )
+        logger.debug(f"[Bridge] Created JSONResponse, returning...")
+        return json_response
+    except Exception as e:
+        logger.error(f"[Bridge] Error creating response: {e}", exc_info=True)
+        raise
+
+
 def register_proxy_routes(app, get_user_id_fn, get_oauth_manager_fn, upstream_url: str):
     """Register proxy routes on the FastAPI app"""
     
@@ -198,6 +268,17 @@ def register_proxy_routes(app, get_user_id_fn, get_oauth_manager_fn, upstream_ur
         user_id = get_user_id_fn(request)
         oauth_manager = get_oauth_manager_fn(user_id)
         return await _proxy_sse_handler(request, oauth_manager, upstream_url)
+
+    # Streamable HTTP bridge endpoint (for clients that only support streamable HTTP)
+    @app.post("/mcp")
+    async def streamable_http_bridge(request: Request):
+        """
+        Bridge endpoint for Streamable HTTP clients.
+        Translates Streamable HTTP → SSE protocol for upstream.
+        """
+        user_id = get_user_id_fn(request)
+        oauth_manager = get_oauth_manager_fn(user_id)
+        return await _streamable_http_bridge_handler(request, oauth_manager, upstream_url, user_id)
     
     
     # Proxy SSE endpoint (with version prefix - supports v1, v2, v3, etc.)

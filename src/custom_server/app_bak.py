@@ -2,6 +2,7 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -29,7 +30,14 @@ mcp_app = mcp.streamable_http_app()
 app = FastAPI(
     lifespan=lambda _: mcp.session_manager.run(),
 )
-
+# Enable CORS with wildcard
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+)
 
 @app.get("/", include_in_schema=False)
 async def serve_index():

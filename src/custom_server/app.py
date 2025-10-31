@@ -5,6 +5,7 @@ Proxies requests to an upstream MCP server with U2M OAuth authentication
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 import os
 from contextlib import asynccontextmanager
 from typing import Dict
@@ -81,6 +82,15 @@ async def lifespan(app: FastAPI):
 
 # Create FastAPI app
 app = FastAPI(lifespan=lifespan)
+
+# Enable CORS with wildcard
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+)
 
 
 @app.get("/", include_in_schema=False)
